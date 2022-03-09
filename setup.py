@@ -20,7 +20,9 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'waypoint_navi = waypoint_navi.waypoint_navi:main'
+            'waypoint_navi = waypoint_navi.waypoint_navi:main',
+            'nav_to_pose_demo = waypoint_navi.nav_to_pose_demo:main',
+            'navigator = waypoint_navi.navigator:main',
         ],
     },
 )
