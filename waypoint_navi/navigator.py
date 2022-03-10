@@ -20,10 +20,7 @@ from rclpy.qos import QoSProfile
 class Navigator(Node):
     def __init__(self):
         super().__init__(node_name='navigator')
-        self.goal_handle = None
-        self.result_future = None
-        self.feedback = None
-        self.status = None
+        self.timeout = 180.0  # [s]
 
         amcl_pose_qos = QoSProfile(
           durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
@@ -60,6 +57,7 @@ class Navigator(Node):
         pose_stamped.pose = self.make_pose(goal2d)
         goal_msg.pose = pose_stamped
 
+        self.feedback = None
         send_goal_future = self.nav_to_pose_client.send_goal_async(
             goal_msg, self.feedback_callback)
         rclpy.spin_until_future_complete(self, send_goal_future)
@@ -70,50 +68,43 @@ class Navigator(Node):
             return False
         self.get_logger().info('ゴールは受け付けられました．')
         self.result_future = self.goal_handle.get_result_async()
-        self.get_logger().info(f'self.result_future: {self.result_future}')
-        return True
+        count = 0
+        while not self.result_future.result():
+            if self.feedback and count % 5 == 0:
+                self.get_logger().info(
+                    f'残り{self.feedback.distance_remaining:.2f}[m]')
+                if (Duration.from_msg(self.feedback.navigation_time)
+                        > Duration(seconds=self.timeout)):
+                    self.get_logger().info(
+                        f'{self.timeout}[s]経過したので取り消します．')
+                    self.cancel_nav()
+            rclpy.spin_until_future_complete(
+                self, self.result_future, timeout_sec=0.10)
+            count += 1
+
+        status = self.result_future.result().status
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info('ゴールに着きました．')
+            return True
+        elif status == GoalStatus.STATUS_ABORTED:
+            self.get_logger().info('ゴールが中断されました．')
+            return False
+        elif status == GoalStatus.STATUS_CANCELED:
+            self.get_logger().info('ゴールが取り消されました．')
+            return False
+        else:
+            self.get_logger().info('結果が不明です．')
+            return False
 
     def feedback_callback(self, msg):
-        self.get_logger().debug('Received action feedback message')
         self.feedback = msg.feedback
-        return
 
     def cancel_nav(self):
-        self.get_logger().info('Canceling current goal.')
+        self.get_logger().info('現在のゴールを取り消します．')
         if self.result_future:
             future = self.goal_handle.cancel_goal_async()
             rclpy.spin_until_future_complete(self, future)
         return
-
-    def is_nav_complete(self):
-        self.get_logger().info(f'self.result_future: {self.result_future}')
-        if not self.result_future:
-            # task was cancelled or completed
-            return True
-        self.get_logger().info('is_nav_complete 100')
-        rclpy.spin_until_future_complete(self, self.result_future, timeout_sec=0.10)
-        self.get_logger().info('is_nav_complete 200')
-        if self.result_future.result():
-            self.get_logger().info('is_nav_complete 300')
-            self.status = self.result_future.result().status
-            if self.status != GoalStatus.STATUS_SUCCEEDED:
-                self.get_logger().info('is_nav_complete 400')
-                self.get_logger().debug('Goal with failed with status code: {0}'.format(self.status))
-                return True
-        else:
-            self.get_logger().info('is_nav_complete 500')
-            # Timed out, still processing, not complete yet
-            return False
-
-        self.get_logger().info('is_nav_complete 600')
-        self.get_logger().debug('Goal succeeded!')
-        return True
-
-    def get_feedback(self):
-        return self.feedback
-
-    def get_result(self):
-        return self.status
 
     def make_pose(self, pose2d):
         x, y, yaw = pose2d
@@ -131,39 +122,34 @@ class Navigator(Node):
         self.wait_for_node('amcl')
         self.wait_for_initial_pose()
         self.wait_for_node('bt_navigator')
-        self.get_logger().info('Nav2 is ready for use!')
+        self.get_logger().info('Nav2が使えるようになりました')
         return
 
     def wait_for_node(self, node_name):
-        # Waits for the node within the tester namespace to become active
-        self.get_logger().debug('Waiting for ' + node_name + ' to become active..')
         node_service = node_name + '/get_state'
         state_client = self.create_client(GetState, node_service)
         while not state_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info(node_service + ' service not available, waiting...')
+            self.get_logger().info(f'{node_service}のサービス無効．待機します...')
 
         req = GetState.Request()
         state = 'unknown'
         while (state != 'active'):
-            self.get_logger().debug('Getting ' + node_name + ' state...')
             future = state_client.call_async(req)
             rclpy.spin_until_future_complete(self, future)
             if future.result() is not None:
                 state = future.result().current_state.label
-                self.get_logger().debug('Result of get_state: %s' % state)
             time.sleep(2)
         return
 
     def wait_for_initial_pose(self):
         while not self.initial_pose_received:
-            self.get_logger().info('Setting initial pose')
+            self.get_logger().info('初期ポーズ設定')
             self.publish_initial_pose()
-            self.get_logger().info('Waiting for amcl_pose to be received')
+            self.get_logger().info('amclのポーズ受信待ち')
             rclpy.spin_once(self, timeout_sec=1.0)
         return
 
     def amcl_pose_callback(self, msg):
-        self.get_logger().debug('Received amcl pose')
         self.initial_pose_received = True
         return
 
@@ -181,23 +167,16 @@ def main(args=None):
     rclpy.init(args=args)
 
     node = Navigator()
-    node.set_initial_pose([0.0, 0.0, 0.0])
-    node.wait_for_nav2()
+    try:
+        node.set_initial_pose([0.0, 0.0, 0.0])
+        node.wait_for_nav2()
 
-    x = float(input('ゴールx座標: '))
-    y = float(input('ゴールy座標: '))
-    yaw = float(input('ゴール方向: '))
-    node.send_goal([x, y, yaw])
-
-    while not node.is_nav_complete():
-        feedback = node.get_feedback()
-        if feedback:
-            print(f'残り {feedback.distance_remaining:.2f}[m]')
-
-    result = node.get_result()
-    if result == GoalStatus.STATUS_SUCCEEDED:
-        print('ゴールに着きました．')
-    else:
-        print('ゴールに着けませんでした．')
+        while True:
+            x = float(input('ゴールx座標: '))
+            y = float(input('ゴールy座標: '))
+            yaw = float(input('ゴール方向: '))
+            node.send_goal([x, y, yaw])
+    except KeyboardInterrupt:
+        pass
 
     rclpy.shutdown()
